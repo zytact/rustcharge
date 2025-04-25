@@ -66,6 +66,7 @@ fn main() {
                     "Discharging"
                 };
 
+                #[cfg(target_os = "linux")]
                 let urgency = match args.urgency {
                     0 => Urgency::Low,
                     1 => Urgency::Normal,
