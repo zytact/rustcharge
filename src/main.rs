@@ -1,11 +1,22 @@
 use battery::State;
-use notify_rust::{Hint, Notification};
+use clap::{Parser, arg};
+use notify_rust::{Notification, Urgency};
 use std::thread;
 use std::time::Duration;
 use utils::battery_status::get_battery_status;
+use utils::sound::play_sound;
 mod utils;
 
+#[derive(Parser)]
+struct Cli {
+    path: String,
+
+    #[arg(value_parser = clap::value_parser!(u8).range(0..=2), default_value = "1", help = "Notification urgency (0=Low, 1=Normal, 2=Critical)")]
+    urgency: u8,
+}
+
 fn main() {
+    let args = Cli::parse();
     loop {
         match get_battery_status() {
             Ok((state, ratio)) => {
@@ -23,13 +34,23 @@ fn main() {
                     "Discharging"
                 };
 
+                let urgency = match args.urgency {
+                    0 => Urgency::Low,
+                    1 => Urgency::Normal,
+                    2 => Urgency::Critical,
+                    _ => Urgency::Normal,
+                };
+
                 let show_notification = |summary: &str, body: &str| {
                     Notification::new()
                         .summary(summary)
                         .body(body)
-                        .hint(Hint::SoundName("message".into()))
+                        .appname("Rustcharge")
+                        .urgency(urgency)
                         .show()
                         .expect("Failed to show notification");
+
+                    play_sound(&args.path);
                 };
 
                 if is_charging && charging_percentage >= 85.0 {
