@@ -15,6 +15,7 @@ struct Cli {
     )]
     path: String,
 
+    #[cfg(target_os = "linux")]
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2), default_value = "1", help = "Notification urgency (0=Low, 1=Normal, 2=Critical)")]
     urgency: u8,
 
