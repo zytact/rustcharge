@@ -9,10 +9,20 @@ mod utils;
 
 #[derive(Parser)]
 struct Cli {
+    #[arg(
+        long = "sound-path",
+        help = "Path to the sound file to play for notifications"
+    )]
     path: String,
 
-    #[arg(value_parser = clap::value_parser!(u8).range(0..=2), default_value = "1", help = "Notification urgency (0=Low, 1=Normal, 2=Critical)")]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2), default_value = "1", help = "Notification urgency (0=Low, 1=Normal, 2=Critical)")]
     urgency: u8,
+
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), default_value = "85", help = "Percentage above which you are notified")]
+    above: u8,
+
+    #[arg(long,value_parser = clap::value_parser!(u8).range(0..=100), default_value = "20", help = "Percentage below which you are notified")]
+    below: u8,
 }
 
 fn main() {
@@ -53,13 +63,13 @@ fn main() {
                     play_sound(&args.path);
                 };
 
-                if is_charging && charging_percentage >= 85.0 {
+                if is_charging && charging_percentage >= args.above as f32 {
                     let summary = format!("Battery Status: {}", status_text);
                     let body = format!("Charge: {:.0}%", charging_percentage);
                     show_notification(&summary, &body);
                 }
 
-                if !is_charging && charging_percentage <= 25.0 {
+                if !is_charging && charging_percentage <= args.below as f32 {
                     let summary = format!("Battery Status: {}", status_text);
                     let body = format!("Charge: {:.0}%", charging_percentage);
                     show_notification(&summary, &body);
