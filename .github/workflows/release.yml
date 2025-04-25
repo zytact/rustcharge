@@ -1,14 +1,9 @@
 name: Build and Release
 
 on:
-    pull_request:
-    types: [closed]
-    branches:
-        - main
-    paths:
-        - '**.rs'
-        - 'Cargo.toml'
-        - 'Cargo.lock'
+    push:
+        branches:
+            - main
 
 jobs:
     build:
