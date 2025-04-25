@@ -73,13 +73,26 @@ fn main() {
                 };
 
                 let show_notification = |summary: &str, body: &str| {
-                    Notification::new()
-                        .summary(summary)
-                        .body(body)
-                        .appname("Rustcharge")
-                        .urgency(urgency)
-                        .show()
-                        .expect("Failed to show notification");
+                    #[cfg(target_os = "linux")]
+                    {
+                        Notification::new()
+                            .summary(summary)
+                            .body(body)
+                            .appname("Rustcharge")
+                            .urgency(urgency)
+                            .show()
+                            .expect("Failed to show notification");
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Notification::new()
+                            .summary(summary)
+                            .body(body)
+                            .appname("Rustcharge")
+                            .show()
+                            .expect("Failed to show notification");
+                    }
 
                     play_sound(&args.path);
                 };
