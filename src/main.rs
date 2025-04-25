@@ -23,6 +23,27 @@ struct Cli {
 
     #[arg(long,value_parser = clap::value_parser!(u8).range(0..=100), default_value = "20", help = "Percentage below which you are notified")]
     below: u8,
+
+    #[arg(
+        long = "no-below",
+        help = "Disable notifications for low battery",
+        action = clap::ArgAction::SetTrue
+    )]
+    no_below: bool,
+
+    #[arg(
+        long = "no-above",
+        help = "Disable notifications for high battery",
+        action = clap::ArgAction::SetTrue
+    )]
+    no_above: bool,
+
+    #[arg(
+        long,
+        default_value = "120",
+        help = "Seconds to wait before checking again"
+    )]
+    sec: u64,
 }
 
 fn main() {
@@ -63,13 +84,13 @@ fn main() {
                     play_sound(&args.path);
                 };
 
-                if is_charging && charging_percentage >= args.above as f32 {
+                if !args.no_above && is_charging && charging_percentage >= args.above as f32 {
                     let summary = format!("Battery Status: {}", status_text);
                     let body = format!("Charge: {:.0}%", charging_percentage);
                     show_notification(&summary, &body);
                 }
 
-                if !is_charging && charging_percentage <= args.below as f32 {
+                if !args.no_below && !is_charging && charging_percentage <= args.below as f32 {
                     let summary = format!("Battery Status: {}", status_text);
                     let body = format!("Charge: {:.0}%", charging_percentage);
                     show_notification(&summary, &body);
@@ -79,6 +100,6 @@ fn main() {
                 eprintln!("Error getting battery status: {}", e);
             }
         }
-        thread::sleep(Duration::from_secs(120));
+        thread::sleep(Duration::from_secs(args.sec));
     }
 }
