@@ -50,6 +50,7 @@ rustcharge --sound-path <sound-file-path> [OPTIONS]
 -   `--no-below`: Disable notifications for low battery
 -   `--no-above`: Disable notifications for high battery
 -   `--sec <seconds>`: Seconds to wait before checking again (default: 120)
+-   `--notify-attempts <count>`: Number of notifications per alert session (default: 15, minimum: 1)
 
 ### Example
 
@@ -59,9 +60,9 @@ rustcharge --sound-path /path/to/notification-sound.mp3 --urgency 2 --above 90 -
 
 ## How It Works
 
-RustCharge uses the `battery` crate to periodically check your battery status. When battery events occur, it sends desktop notifications using the `notify-rust` crate and plays a custom sound using `rodio`.
+RustCharge uses the `battery` crate to periodically check your battery status. When the battery crosses a threshold (above or below configured levels), it starts a notification session and sends alerts up to the configured `--notify-attempts` limit. Once the notification limit is reached, the session ends and no further notifications are sent until the battery crosses a threshold again, starting a new session.
 
-The monitoring runs in a loop, checking battery status every 120 seconds.
+The monitoring runs in a loop, checking battery status at the interval specified by `--sec` (default: 120 seconds).
 
 ## Platform Support
 
