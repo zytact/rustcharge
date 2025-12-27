@@ -65,6 +65,7 @@ enum SessionType {
 struct NotificationSession {
     session_type: SessionType,
     attempts_made: u64,
+    last_ended_session: SessionType,
 }
 
 impl NotificationSession {
@@ -72,6 +73,7 @@ impl NotificationSession {
         Self {
             session_type: SessionType::None,
             attempts_made: 0,
+            last_ended_session: SessionType::None,
         }
     }
 
@@ -93,8 +95,21 @@ impl NotificationSession {
     }
 
     fn end_session(&mut self) {
+        self.last_ended_session = self.session_type;
         self.session_type = SessionType::None;
         self.attempts_made = 0;
+    }
+
+    fn can_start_session(&self, session_type: SessionType) -> bool {
+        // Can start a new session if:
+        // 1. No session is active, AND
+        // 2. Either this is a different threshold type than the last ended one,
+        //    OR no session has ended yet
+        !self.is_active() && self.last_ended_session != session_type
+    }
+
+    fn clear_last_ended(&mut self) {
+        self.last_ended_session = SessionType::None;
     }
 }
 
@@ -146,41 +161,56 @@ fn main() {
                     "Discharging"
                 };
 
-                // Determine current battery condition
+                // Determine current battery condition for starting new sessions
                 let above_threshold =
                     !args.no_above && is_charging && charging_percentage >= args.above as f32;
                 let below_threshold =
                     !args.no_below && !is_charging && charging_percentage <= args.below as f32;
 
+                // Handle battery entering safe zone
+                if !above_threshold && !below_threshold {
+                    // If there's an active session, terminate it
+                    if session.is_active() {
+                        session.end_session();
+                    }
+                    // Clear last_ended_session flag when battery is in safe zone
+                    else if session.last_ended_session != SessionType::None {
+                        session.clear_last_ended();
+                    }
+                }
+
                 // Session state machine
                 match session.session_type {
                     SessionType::None => {
                         // Not in a session - check if we should start one
-                        if above_threshold {
+                        if above_threshold && session.can_start_session(SessionType::AboveThreshold)
+                        {
                             session.start_session(SessionType::AboveThreshold);
-                        } else if below_threshold {
+                        } else if below_threshold
+                            && session.can_start_session(SessionType::BelowThreshold)
+                        {
                             session.start_session(SessionType::BelowThreshold);
                         }
                     }
-                    SessionType::AboveThreshold => {
-                        // If battery is no longer above threshold, end the session
-                        if !above_threshold {
-                            session.end_session();
-                        }
-                    }
-                    SessionType::BelowThreshold => {
-                        // If battery is no longer below threshold, end the session
-                        if !below_threshold {
-                            session.end_session();
-                        }
+                    SessionType::AboveThreshold | SessionType::BelowThreshold => {
+                        // In an active session - keep it active until attempts are exhausted
+                        // Session will be ended when notify_attempts limit is reached (see below)
                     }
                 }
 
                 // Send notification if session is active and attempts remain
                 if session.is_active() && session.should_notify(args.notify_attempts) {
+                    // Check if current conditions match the session type
+                    // For active sessions, we check conditions that match the session
                     let should_send = match session.session_type {
-                        SessionType::AboveThreshold => above_threshold,
-                        SessionType::BelowThreshold => below_threshold,
+                        SessionType::AboveThreshold => {
+                            // Only check if above threshold and charging (original condition)
+                            above_threshold
+                        }
+                        SessionType::BelowThreshold => {
+                            // Only check if below threshold and not charging (original condition)
+                            below_threshold
+                        }
                         SessionType::None => false,
                     };
 
