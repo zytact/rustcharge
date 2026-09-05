@@ -444,21 +444,8 @@ fn handle_control(
                 next_stored.validate()?;
                 next_stored.save(config_path)?;
                 effect = control_effect(config, session, key, &parsed);
-                if matches!(effect, ControlEffect::EvaluateNow(_))
-                    && matches!(
-                        (key, &parsed),
-                        (SettingKey::AboveEnabled, config::SettingValue::Bool(false))
-                    )
-                {
-                    epochs.cancel(SessionType::AboveThreshold);
-                }
-                if matches!(effect, ControlEffect::EvaluateNow(_))
-                    && matches!(
-                        (key, &parsed),
-                        (SettingKey::BelowEnabled, config::SettingValue::Bool(false))
-                    )
-                {
-                    epochs.cancel(SessionType::BelowThreshold);
+                if let Some(threshold) = disabled_threshold(config, key, &parsed) {
+                    epochs.cancel(threshold);
                 }
                 if matches!(effect, ControlEffect::EvaluateNow(_)) {
                     session.setting_changed(key, &parsed);
@@ -475,6 +462,22 @@ fn handle_control(
         effect
     } else {
         ControlEffect::KeepDeadline
+    }
+}
+
+fn disabled_threshold(
+    config: &RuntimeConfig,
+    key: SettingKey,
+    value: &config::SettingValue,
+) -> Option<SessionType> {
+    match (key, value) {
+        (SettingKey::AboveEnabled, config::SettingValue::Bool(false)) if config.above_enabled => {
+            Some(SessionType::AboveThreshold)
+        }
+        (SettingKey::BelowEnabled, config::SettingValue::Bool(false)) if config.below_enabled => {
+            Some(SessionType::BelowThreshold)
+        }
+        _ => None,
     }
 }
 
@@ -721,6 +724,51 @@ mod tests {
         );
         assert_eq!(session.session_type, SessionType::AboveThreshold);
         assert_eq!(session.attempts_made, 1);
+    }
+
+    #[test]
+    fn changed_disables_cancel_sound_during_opposite_sessions() {
+        let config = RuntimeConfig::defaults("sound.wav".to_string());
+        let epochs = SoundEpochs::new();
+        for (key, value, active, canceled) in [
+            (
+                SettingKey::AboveEnabled,
+                config::SettingValue::Bool(false),
+                SessionType::BelowThreshold,
+                SessionType::AboveThreshold,
+            ),
+            (
+                SettingKey::BelowEnabled,
+                config::SettingValue::Bool(false),
+                SessionType::AboveThreshold,
+                SessionType::BelowThreshold,
+            ),
+        ] {
+            let mut session = NotificationSession::new();
+            session.start_session(active);
+            session.increment_attempt();
+            assert_eq!(
+                control_effect(&config, &session, key, &value),
+                ControlEffect::KeepDeadline
+            );
+            let threshold = disabled_threshold(&config, key, &value).unwrap();
+            let previous_epoch = epochs.current(threshold);
+            epochs.cancel(threshold);
+            assert_eq!(threshold, canceled);
+            assert_eq!(epochs.current(threshold), previous_epoch + 1);
+            assert_eq!(session.attempts_made, 1);
+        }
+
+        let mut disabled = config;
+        disabled.above_enabled = false;
+        assert_eq!(
+            disabled_threshold(
+                &disabled,
+                SettingKey::AboveEnabled,
+                &config::SettingValue::Bool(false)
+            ),
+            None
+        );
     }
 
     #[test]
