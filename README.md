@@ -64,6 +64,28 @@ RustCharge uses the `battery` crate to periodically check your battery status. W
 
 The monitoring runs in a loop, checking battery status at the interval specified by `--sec` (default: 120 seconds).
 
+## Runtime settings
+
+While the monitor is running, use `set` to change its settings and `status` to read the effective configuration:
+
+```sh
+rustcharge set above-enabled false
+rustcharge set below-enabled false
+rustcharge set above-enabled true
+rustcharge set above 90
+rustcharge status
+```
+
+The available settings are `above`, `below`, `above-enabled`, `below-enabled`, `sound-path`, `sec`, and `notify-attempts`. Linux also supports `urgency`. Percentages must be from 0 to 100, urgency must be from 0 to 2, and notification attempts must be at least 1.
+
+`set` and `status` connect to an existing monitor. They do not start one. Commands respond without waiting for the polling interval, and a successful `set` writes the change to the per-user config file before applying it. Threshold changes trigger an immediate battery evaluation. `status`, sound, urgency, and notification-attempt changes preserve the next scheduled check. Changing `sec` starts a new interval from that command. Rustcharge stores configuration in `%APPDATA%\rustcharge\config.toml` on Windows, `$XDG_CONFIG_HOME/rustcharge/config.toml` when `XDG_CONFIG_HOME` is set, or `~/.config/rustcharge/config.toml` otherwise.
+
+Settings use this precedence, from lowest to highest: built-in defaults, persisted settings, and explicit flags passed when the monitor starts. A runtime `set` command replaces that setting for the running monitor and persists it. Other explicit startup flags remain process-only and are not copied into the config file.
+
+Disabling a threshold ends its current alert session and discards any queued sound for that threshold. A sound that has already started can finish. Enabling the threshold allows a fresh evaluation. Changing sound or urgency keeps the current session's notification attempt count.
+
+The control listener accepts authenticated connections only on the local machine. On Linux and macOS, Rustcharge restricts its control files to the current user. On Windows, the files inherit the access controls of the user's AppData directory.
+
 ## Platform Support
 
 -   **Linux**: Full support

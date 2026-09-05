@@ -11,6 +11,7 @@ code: when a feature is added, changed, or removed, update the file here in the 
 | Notification content and urgency | [notification-content.md](notification-content.md) | `--urgency`, summary and body text |
 | Sound playback | [sound-playback.md](sound-playback.md) | `--sound-path` |
 | CLI arguments | [cli-arguments.md](cli-arguments.md) | argument parsing, ranges, defaults, `--help` |
+| Runtime settings | [runtime-settings.md](runtime-settings.md) | `set`, `status`, persistence, live session changes |
 
 All of these run through the same harness. Read `../SKILL.md` before driving any of them.
 
