@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use utils::battery_status::get_battery_status;
 use utils::sound::play_sound;
 
@@ -162,6 +162,13 @@ struct SoundJob {
     epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlEffect {
+    KeepDeadline,
+    EvaluateNow,
+    ResetDeadline,
+}
+
 fn start_sound_worker(epochs: Arc<SoundEpochs>) -> SyncSender<SoundJob> {
     let (sender, receiver) = mpsc::sync_channel::<SoundJob>(1);
     thread::spawn(move || {
@@ -251,19 +258,29 @@ fn run_monitor(args: MonitorArgs, app_dir: std::path::PathBuf) -> Result<(), Str
     let epochs = Arc::new(SoundEpochs::new());
     let sound_sender = start_sound_worker(Arc::clone(&epochs));
     let mut session = NotificationSession::new();
+    evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+    let mut next_check = Instant::now() + Duration::from_secs(config.sec);
 
     loop {
-        evaluate_battery(&config, &mut session, &sound_sender, &epochs);
-        match control_receiver.recv_timeout(Duration::from_secs(config.sec)) {
-            Ok(request) => handle_control(
-                request,
-                &mut stored,
-                &mut config,
-                &mut session,
-                &epochs,
-                &config_path,
-            ),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        match control_receiver.recv_timeout(next_check.saturating_duration_since(Instant::now())) {
+            Ok(request) => {
+                let effect = handle_control(
+                    request,
+                    &mut stored,
+                    &mut config,
+                    &mut session,
+                    &epochs,
+                    &config_path,
+                );
+                if effect == ControlEffect::EvaluateNow {
+                    evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+                }
+                next_check = update_deadline(effect, next_check, Instant::now(), config.sec);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+                next_check = Instant::now() + Duration::from_secs(config.sec);
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("Control listener stopped".to_string());
             }
@@ -349,7 +366,8 @@ fn handle_control(
     session: &mut NotificationSession,
     epochs: &SoundEpochs,
     config_path: &std::path::Path,
-) {
+) -> ControlEffect {
+    let mut effect = ControlEffect::KeepDeadline;
     let response = match request.command {
         ControlCommand::Status => Ok(config.status()),
         ControlCommand::Set { key, value } => {
@@ -357,26 +375,85 @@ fn handle_control(
             next_stored.set(key, &value).and_then(|parsed| {
                 next_stored.validate()?;
                 next_stored.save(config_path)?;
-                if matches!(
-                    (key, &parsed),
-                    (SettingKey::AboveEnabled, config::SettingValue::Bool(false))
-                ) {
+                effect = control_effect(config, key, &parsed);
+                if effect == ControlEffect::EvaluateNow
+                    && matches!(
+                        (key, &parsed),
+                        (SettingKey::AboveEnabled, config::SettingValue::Bool(false))
+                    )
+                {
                     epochs.cancel(SessionType::AboveThreshold);
                 }
-                if matches!(
-                    (key, &parsed),
-                    (SettingKey::BelowEnabled, config::SettingValue::Bool(false))
-                ) {
+                if effect == ControlEffect::EvaluateNow
+                    && matches!(
+                        (key, &parsed),
+                        (SettingKey::BelowEnabled, config::SettingValue::Bool(false))
+                    )
+                {
                     epochs.cancel(SessionType::BelowThreshold);
                 }
-                session.setting_changed(key, &parsed);
+                if effect == ControlEffect::EvaluateNow {
+                    session.setting_changed(key, &parsed);
+                }
                 config.apply_setting(key, parsed);
                 *stored = next_stored;
                 Ok(config.status())
             })
         }
     };
+    let succeeded = response.is_ok();
     let _ = request.reply.send(response);
+    if succeeded {
+        effect
+    } else {
+        ControlEffect::KeepDeadline
+    }
+}
+
+fn control_effect(
+    config: &RuntimeConfig,
+    key: SettingKey,
+    value: &config::SettingValue,
+) -> ControlEffect {
+    use config::SettingValue;
+    let changed = match (key, value) {
+        (SettingKey::Above, SettingValue::U8(value)) => config.above != *value,
+        (SettingKey::Below, SettingValue::U8(value)) => config.below != *value,
+        (SettingKey::AboveEnabled, SettingValue::Bool(value)) => config.above_enabled != *value,
+        (SettingKey::BelowEnabled, SettingValue::Bool(value)) => config.below_enabled != *value,
+        (SettingKey::SoundPath, SettingValue::String(value)) => config.sound_path != *value,
+        (SettingKey::Urgency, SettingValue::U8(value)) => config.urgency != *value,
+        (SettingKey::Sec, SettingValue::U64(value)) => config.sec != *value,
+        (SettingKey::NotifyAttempts, SettingValue::U64(value)) => config.notify_attempts != *value,
+        _ => unreachable!(),
+    };
+    if !changed {
+        return ControlEffect::KeepDeadline;
+    }
+    match key {
+        SettingKey::Above
+        | SettingKey::Below
+        | SettingKey::AboveEnabled
+        | SettingKey::BelowEnabled => ControlEffect::EvaluateNow,
+        SettingKey::Sec => ControlEffect::ResetDeadline,
+        SettingKey::SoundPath | SettingKey::Urgency | SettingKey::NotifyAttempts => {
+            ControlEffect::KeepDeadline
+        }
+    }
+}
+
+fn update_deadline(
+    effect: ControlEffect,
+    current: Instant,
+    now: Instant,
+    interval_seconds: u64,
+) -> Instant {
+    match effect {
+        ControlEffect::KeepDeadline => current,
+        ControlEffect::EvaluateNow | ControlEffect::ResetDeadline => {
+            now + Duration::from_secs(interval_seconds)
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut RuntimeConfig, args: MonitorArgs) {
@@ -457,5 +534,50 @@ mod tests {
         assert_eq!(battery_conditions(&config, true, 84.9), (false, false));
         assert_eq!(battery_conditions(&config, false, 20.0), (false, true));
         assert_eq!(battery_conditions(&config, false, 20.1), (false, false));
+    }
+
+    #[test]
+    fn observational_commands_preserve_the_poll_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(120);
+        let later = now + Duration::from_secs(15);
+        assert_eq!(
+            update_deadline(ControlEffect::KeepDeadline, deadline, later, 120),
+            deadline
+        );
+    }
+
+    #[test]
+    fn interval_and_evaluation_changes_reset_the_poll_deadline() {
+        let now = Instant::now();
+        let old_deadline = now + Duration::from_secs(120);
+        let changed_at = now + Duration::from_secs(10);
+        for effect in [ControlEffect::EvaluateNow, ControlEffect::ResetDeadline] {
+            assert_eq!(
+                update_deadline(effect, old_deadline, changed_at, 30),
+                changed_at + Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn only_changed_thresholds_request_immediate_evaluation() {
+        let config = RuntimeConfig::defaults("sound.wav".to_string());
+        assert_eq!(
+            control_effect(&config, SettingKey::Above, &config::SettingValue::U8(90)),
+            ControlEffect::EvaluateNow
+        );
+        assert_eq!(
+            control_effect(&config, SettingKey::Above, &config::SettingValue::U8(85)),
+            ControlEffect::KeepDeadline
+        );
+        assert_eq!(
+            control_effect(&config, SettingKey::Urgency, &config::SettingValue::U8(2)),
+            ControlEffect::KeepDeadline
+        );
+        assert_eq!(
+            control_effect(&config, SettingKey::Sec, &config::SettingValue::U64(30)),
+            ControlEffect::ResetDeadline
+        );
     }
 }

@@ -78,7 +78,7 @@ rustcharge status
 
 The available settings are `above`, `below`, `above-enabled`, `below-enabled`, `sound-path`, `sec`, and `notify-attempts`. Linux also supports `urgency`. Percentages must be from 0 to 100, urgency must be from 0 to 2, and notification attempts must be at least 1.
 
-`set` and `status` connect to an existing monitor. They do not start one. A command wakes the monitor without waiting for the polling interval, and a successful `set` writes the change to the per-user config file before applying it. Rustcharge stores configuration in `%APPDATA%\rustcharge\config.toml` on Windows, `$XDG_CONFIG_HOME/rustcharge/config.toml` when `XDG_CONFIG_HOME` is set, or `~/.config/rustcharge/config.toml` otherwise.
+`set` and `status` connect to an existing monitor. They do not start one. Commands respond without waiting for the polling interval, and a successful `set` writes the change to the per-user config file before applying it. Threshold changes trigger an immediate battery evaluation. `status`, sound, urgency, and notification-attempt changes preserve the next scheduled check. Changing `sec` starts a new interval from that command. Rustcharge stores configuration in `%APPDATA%\rustcharge\config.toml` on Windows, `$XDG_CONFIG_HOME/rustcharge/config.toml` when `XDG_CONFIG_HOME` is set, or `~/.config/rustcharge/config.toml` otherwise.
 
 Settings use this precedence, from lowest to highest: built-in defaults, persisted settings, and explicit flags passed when the monitor starts. A runtime `set` command replaces that setting for the running monitor and persists it. Other explicit startup flags remain process-only and are not copied into the config file.
 

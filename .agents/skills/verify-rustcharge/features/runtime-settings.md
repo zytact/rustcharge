@@ -1,12 +1,13 @@
 # Runtime settings
 
-An existing monitor accepts authenticated local `set` and `status` commands. Accepted changes are written to the per-user config file and wake the monitor for an immediate battery evaluation.
+An existing monitor accepts authenticated local `set` and `status` commands. Accepted changes are written to the per-user config file. Threshold changes trigger an immediate battery evaluation.
 
 ## Sub-features
 
 - `above`, `below`, `above-enabled`, and `below-enabled` change threshold behavior while the monitor runs.
 - `sound-path`, `sec`, and `notify-attempts` update their matching monitor settings. Linux also supports `urgency`.
 - `status` reports the effective live configuration.
+- `status`, sound, urgency, and notification-attempt changes preserve the next scheduled battery check. Changing `sec` starts a new interval.
 - Invalid values and persistence failures leave the live setting unchanged.
 - Disabling a threshold ends its alert session and cancels queued sound for that threshold. Enabling it allows a fresh session.
 - Sound and urgency changes preserve the current notification attempt count.
