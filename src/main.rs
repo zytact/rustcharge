@@ -105,6 +105,8 @@ impl NotificationSession {
 
     fn setting_changed(&mut self, key: SettingKey, value: &config::SettingValue) {
         let affected = match (key, value) {
+            (SettingKey::Above, config::SettingValue::U8(_)) => SessionType::AboveThreshold,
+            (SettingKey::Below, config::SettingValue::U8(_)) => SessionType::BelowThreshold,
             (SettingKey::AboveEnabled, config::SettingValue::Bool(_)) => {
                 SessionType::AboveThreshold
             }
@@ -113,13 +115,22 @@ impl NotificationSession {
             }
             _ => return,
         };
-        let config::SettingValue::Bool(enabled) = value else {
-            unreachable!()
-        };
-        if !enabled && self.session_type == affected {
-            self.end_session();
-        } else if *enabled && self.last_ended_session == affected {
-            self.clear_last_ended();
+        match value {
+            config::SettingValue::Bool(false) if self.session_type == affected => {
+                self.end_session();
+            }
+            config::SettingValue::Bool(true) if self.last_ended_session == affected => {
+                self.clear_last_ended();
+            }
+            config::SettingValue::U8(_) => {
+                if self.session_type == affected {
+                    self.end_session();
+                }
+                if self.last_ended_session == affected {
+                    self.clear_last_ended();
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -302,30 +313,7 @@ fn evaluate_battery(
     let is_charging = matches!(state, State::Charging);
     let percentage = ratio.value * 100.0;
     let (above, below) = battery_conditions(config, is_charging, percentage);
-
-    if !above && !below {
-        if session.is_active() {
-            session.end_session();
-        } else if session.last_ended_session != SessionType::None {
-            session.clear_last_ended();
-        }
-    }
-    if session.is_active() && !session.should_notify(config.notify_attempts) {
-        session.end_session();
-    }
-    if !session.is_active() {
-        if above && session.can_start_session(SessionType::AboveThreshold) {
-            session.start_session(SessionType::AboveThreshold);
-        } else if below && session.can_start_session(SessionType::BelowThreshold) {
-            session.start_session(SessionType::BelowThreshold);
-        }
-    }
-
-    let should_send = match session.session_type {
-        SessionType::AboveThreshold => above,
-        SessionType::BelowThreshold => below,
-        SessionType::None => false,
-    };
+    let should_send = update_session_for_conditions(session, above, below, config.notify_attempts);
     if should_send && session.should_notify(config.notify_attempts) {
         let status = if is_charging {
             "Charging"
@@ -349,6 +337,37 @@ fn evaluate_battery(
         if !session.should_notify(config.notify_attempts) {
             session.end_session();
         }
+    }
+}
+
+fn update_session_for_conditions(
+    session: &mut NotificationSession,
+    above: bool,
+    below: bool,
+    max_attempts: u64,
+) -> bool {
+    if !above && !below {
+        if session.is_active() {
+            session.end_session();
+        }
+        if session.last_ended_session != SessionType::None {
+            session.clear_last_ended();
+        }
+    }
+    if session.is_active() && !session.should_notify(max_attempts) {
+        session.end_session();
+    }
+    if !session.is_active() {
+        if above && session.can_start_session(SessionType::AboveThreshold) {
+            session.start_session(SessionType::AboveThreshold);
+        } else if below && session.can_start_session(SessionType::BelowThreshold) {
+            session.start_session(SessionType::BelowThreshold);
+        }
+    }
+    match session.session_type {
+        SessionType::AboveThreshold => above,
+        SessionType::BelowThreshold => below,
+        SessionType::None => false,
     }
 }
 
@@ -579,5 +598,47 @@ mod tests {
             control_effect(&config, SettingKey::Sec, &config::SettingValue::U64(30)),
             ControlEffect::ResetDeadline
         );
+    }
+
+    #[test]
+    fn changed_threshold_starts_a_fresh_session_after_becoming_safe() {
+        let mut session = NotificationSession::new();
+        assert!(update_session_for_conditions(&mut session, true, false, 5));
+        session.increment_attempt();
+
+        session.setting_changed(SettingKey::AboveEnabled, &config::SettingValue::Bool(false));
+        session.setting_changed(SettingKey::AboveEnabled, &config::SettingValue::Bool(true));
+        assert!(update_session_for_conditions(&mut session, true, false, 5));
+        session.increment_attempt();
+
+        session.setting_changed(SettingKey::Above, &config::SettingValue::U8(95));
+        assert!(!update_session_for_conditions(
+            &mut session,
+            false,
+            false,
+            5
+        ));
+        session.setting_changed(SettingKey::Above, &config::SettingValue::U8(90));
+        assert!(update_session_for_conditions(&mut session, true, false, 5));
+        assert_eq!(session.attempts_made, 0);
+    }
+
+    #[test]
+    fn safe_zone_clears_low_threshold_suppression_in_one_evaluation() {
+        let mut session = NotificationSession::new();
+        session.start_session(SessionType::BelowThreshold);
+        session.end_session();
+        assert!(!update_session_for_conditions(
+            &mut session,
+            false,
+            false,
+            5
+        ));
+        assert_eq!(session.last_ended_session, SessionType::None);
+        assert!(update_session_for_conditions(&mut session, false, true, 5));
+
+        session.end_session();
+        session.setting_changed(SettingKey::Below, &config::SettingValue::U8(25));
+        assert!(session.can_start_session(SessionType::BelowThreshold));
     }
 }
