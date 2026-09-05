@@ -176,7 +176,7 @@ struct SoundJob {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlEffect {
     KeepDeadline,
-    EvaluateNow,
+    EvaluateNow(SessionType),
     ResetDeadline,
 }
 
@@ -269,7 +269,7 @@ fn run_monitor(args: MonitorArgs, app_dir: std::path::PathBuf) -> Result<(), Str
     let epochs = Arc::new(SoundEpochs::new());
     let sound_sender = start_sound_worker(Arc::clone(&epochs));
     let mut session = NotificationSession::new();
-    evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+    evaluate_battery(&config, &mut session, &sound_sender, &epochs, None);
     let mut next_check = Instant::now() + Duration::from_secs(config.sec);
 
     loop {
@@ -283,13 +283,19 @@ fn run_monitor(args: MonitorArgs, app_dir: std::path::PathBuf) -> Result<(), Str
                     &epochs,
                     &config_path,
                 );
-                if effect == ControlEffect::EvaluateNow {
-                    evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+                if let ControlEffect::EvaluateNow(threshold) = effect {
+                    evaluate_battery(
+                        &config,
+                        &mut session,
+                        &sound_sender,
+                        &epochs,
+                        Some(threshold),
+                    );
                 }
                 next_check = update_deadline(effect, next_check, Instant::now(), config.sec);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+                evaluate_battery(&config, &mut session, &sound_sender, &epochs, None);
                 next_check = Instant::now() + Duration::from_secs(config.sec);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -304,6 +310,7 @@ fn evaluate_battery(
     session: &mut NotificationSession,
     sound_sender: &SyncSender<SoundJob>,
     epochs: &SoundEpochs,
+    threshold: Option<SessionType>,
 ) {
     let Ok((state, ratio)) = get_battery_status()
         .inspect_err(|error| eprintln!("Error getting battery status: {error}"))
@@ -313,7 +320,22 @@ fn evaluate_battery(
     let is_charging = matches!(state, State::Charging);
     let percentage = ratio.value * 100.0;
     let (above, below) = battery_conditions(config, is_charging, percentage);
-    let should_send = update_session_for_conditions(session, above, below, config.notify_attempts);
+    let should_send = match threshold {
+        Some(SessionType::AboveThreshold) => update_session_for_threshold(
+            session,
+            SessionType::AboveThreshold,
+            above,
+            config.notify_attempts,
+        ),
+        Some(SessionType::BelowThreshold) => update_session_for_threshold(
+            session,
+            SessionType::BelowThreshold,
+            below,
+            config.notify_attempts,
+        ),
+        Some(SessionType::None) => unreachable!(),
+        None => update_session_for_conditions(session, above, below, config.notify_attempts),
+    };
     if should_send && session.should_notify(config.notify_attempts) {
         let status = if is_charging {
             "Charging"
@@ -371,6 +393,33 @@ fn update_session_for_conditions(
     }
 }
 
+fn update_session_for_threshold(
+    session: &mut NotificationSession,
+    threshold: SessionType,
+    condition: bool,
+    max_attempts: u64,
+) -> bool {
+    if session.is_active() && session.session_type != threshold {
+        return false;
+    }
+    if !condition {
+        if session.session_type == threshold {
+            session.end_session();
+        }
+        if session.last_ended_session == threshold {
+            session.clear_last_ended();
+        }
+        return false;
+    }
+    if session.session_type == threshold && !session.should_notify(max_attempts) {
+        session.end_session();
+    }
+    if session.can_start_session(threshold) {
+        session.start_session(threshold);
+    }
+    session.session_type == threshold && session.should_notify(max_attempts)
+}
+
 fn battery_conditions(config: &RuntimeConfig, is_charging: bool, percentage: f32) -> (bool, bool) {
     (
         config.above_enabled && is_charging && percentage >= config.above as f32,
@@ -394,8 +443,8 @@ fn handle_control(
             next_stored.set(key, &value).and_then(|parsed| {
                 next_stored.validate()?;
                 next_stored.save(config_path)?;
-                effect = control_effect(config, key, &parsed);
-                if effect == ControlEffect::EvaluateNow
+                effect = control_effect(config, session, key, &parsed);
+                if matches!(effect, ControlEffect::EvaluateNow(_))
                     && matches!(
                         (key, &parsed),
                         (SettingKey::AboveEnabled, config::SettingValue::Bool(false))
@@ -403,7 +452,7 @@ fn handle_control(
                 {
                     epochs.cancel(SessionType::AboveThreshold);
                 }
-                if effect == ControlEffect::EvaluateNow
+                if matches!(effect, ControlEffect::EvaluateNow(_))
                     && matches!(
                         (key, &parsed),
                         (SettingKey::BelowEnabled, config::SettingValue::Bool(false))
@@ -411,7 +460,7 @@ fn handle_control(
                 {
                     epochs.cancel(SessionType::BelowThreshold);
                 }
-                if effect == ControlEffect::EvaluateNow {
+                if matches!(effect, ControlEffect::EvaluateNow(_)) {
                     session.setting_changed(key, &parsed);
                 }
                 config.apply_setting(key, parsed);
@@ -431,6 +480,7 @@ fn handle_control(
 
 fn control_effect(
     config: &RuntimeConfig,
+    session: &NotificationSession,
     key: SettingKey,
     value: &config::SettingValue,
 ) -> ControlEffect {
@@ -449,15 +499,26 @@ fn control_effect(
     if !changed {
         return ControlEffect::KeepDeadline;
     }
+    let threshold = match key {
+        SettingKey::Above | SettingKey::AboveEnabled => Some(SessionType::AboveThreshold),
+        SettingKey::Below | SettingKey::BelowEnabled => Some(SessionType::BelowThreshold),
+        _ => None,
+    };
+    if let Some(threshold) = threshold {
+        if session.is_active() && session.session_type != threshold {
+            return ControlEffect::KeepDeadline;
+        }
+        return ControlEffect::EvaluateNow(threshold);
+    }
     match key {
-        SettingKey::Above
-        | SettingKey::Below
-        | SettingKey::AboveEnabled
-        | SettingKey::BelowEnabled => ControlEffect::EvaluateNow,
         SettingKey::Sec => ControlEffect::ResetDeadline,
         SettingKey::SoundPath | SettingKey::Urgency | SettingKey::NotifyAttempts => {
             ControlEffect::KeepDeadline
         }
+        SettingKey::Above
+        | SettingKey::Below
+        | SettingKey::AboveEnabled
+        | SettingKey::BelowEnabled => unreachable!(),
     }
 }
 
@@ -469,7 +530,7 @@ fn update_deadline(
 ) -> Instant {
     match effect {
         ControlEffect::KeepDeadline => current,
-        ControlEffect::EvaluateNow | ControlEffect::ResetDeadline => {
+        ControlEffect::EvaluateNow(_) | ControlEffect::ResetDeadline => {
             now + Duration::from_secs(interval_seconds)
         }
     }
@@ -571,7 +632,10 @@ mod tests {
         let now = Instant::now();
         let old_deadline = now + Duration::from_secs(120);
         let changed_at = now + Duration::from_secs(10);
-        for effect in [ControlEffect::EvaluateNow, ControlEffect::ResetDeadline] {
+        for effect in [
+            ControlEffect::EvaluateNow(SessionType::AboveThreshold),
+            ControlEffect::ResetDeadline,
+        ] {
             assert_eq!(
                 update_deadline(effect, old_deadline, changed_at, 30),
                 changed_at + Duration::from_secs(30)
@@ -582,22 +646,81 @@ mod tests {
     #[test]
     fn only_changed_thresholds_request_immediate_evaluation() {
         let config = RuntimeConfig::defaults("sound.wav".to_string());
+        let session = NotificationSession::new();
         assert_eq!(
-            control_effect(&config, SettingKey::Above, &config::SettingValue::U8(90)),
-            ControlEffect::EvaluateNow
+            control_effect(
+                &config,
+                &session,
+                SettingKey::Above,
+                &config::SettingValue::U8(90)
+            ),
+            ControlEffect::EvaluateNow(SessionType::AboveThreshold)
         );
         assert_eq!(
-            control_effect(&config, SettingKey::Above, &config::SettingValue::U8(85)),
+            control_effect(
+                &config,
+                &session,
+                SettingKey::Above,
+                &config::SettingValue::U8(85)
+            ),
             ControlEffect::KeepDeadline
         );
         assert_eq!(
-            control_effect(&config, SettingKey::Urgency, &config::SettingValue::U8(2)),
+            control_effect(
+                &config,
+                &session,
+                SettingKey::Urgency,
+                &config::SettingValue::U8(2)
+            ),
             ControlEffect::KeepDeadline
         );
         assert_eq!(
-            control_effect(&config, SettingKey::Sec, &config::SettingValue::U64(30)),
+            control_effect(
+                &config,
+                &session,
+                SettingKey::Sec,
+                &config::SettingValue::U64(30)
+            ),
             ControlEffect::ResetDeadline
         );
+    }
+
+    #[test]
+    fn above_changes_preserve_an_active_below_session() {
+        let config = RuntimeConfig::defaults("sound.wav".to_string());
+        let mut session = NotificationSession::new();
+        session.start_session(SessionType::BelowThreshold);
+        session.increment_attempt();
+        assert_eq!(
+            control_effect(
+                &config,
+                &session,
+                SettingKey::Above,
+                &config::SettingValue::U8(90)
+            ),
+            ControlEffect::KeepDeadline
+        );
+        assert_eq!(session.session_type, SessionType::BelowThreshold);
+        assert_eq!(session.attempts_made, 1);
+    }
+
+    #[test]
+    fn below_changes_preserve_an_active_above_session() {
+        let config = RuntimeConfig::defaults("sound.wav".to_string());
+        let mut session = NotificationSession::new();
+        session.start_session(SessionType::AboveThreshold);
+        session.increment_attempt();
+        assert_eq!(
+            control_effect(
+                &config,
+                &session,
+                SettingKey::BelowEnabled,
+                &config::SettingValue::Bool(false)
+            ),
+            ControlEffect::KeepDeadline
+        );
+        assert_eq!(session.session_type, SessionType::AboveThreshold);
+        assert_eq!(session.attempts_made, 1);
     }
 
     #[test]

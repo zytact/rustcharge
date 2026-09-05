@@ -3,12 +3,16 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const MAX_REQUEST_BYTES: u64 = 8192;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECTION_WORKERS: usize = 4;
+const CONNECTION_QUEUE_SIZE: usize = 16;
 
 pub enum ControlCommand {
     Status,
@@ -39,11 +43,38 @@ impl Server {
         let endpoint_path = app_dir.join("daemon.endpoint");
         claim_endpoint(&endpoint_path, &endpoint_contents)?;
 
-        let server_token = token;
+        let (connection_sender, connection_receiver) =
+            mpsc::sync_channel::<TcpStream>(CONNECTION_QUEUE_SIZE);
+        let connection_receiver = Arc::new(Mutex::new(connection_receiver));
+        let server_token: Arc<str> = token.into();
+        for _ in 0..CONNECTION_WORKERS {
+            let receiver = Arc::clone(&connection_receiver);
+            let token = Arc::clone(&server_token);
+            let sender = sender.clone();
+            thread::spawn(move || {
+                loop {
+                    let stream = receiver
+                        .lock()
+                        .expect("connection queue lock should not be poisoned")
+                        .recv();
+                    let Ok(stream) = stream else {
+                        break;
+                    };
+                    handle_connection(stream, &token, &sender);
+                }
+            });
+        }
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => handle_connection(stream, &server_token, &sender),
+                    Ok(stream) => match connection_sender.try_send(stream) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(mut stream)) => {
+                            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                            let _ = writeln!(stream, "ERR\nrustcharge control server is busy");
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
+                    },
                     Err(error) => eprintln!("Control listener error: {error}"),
                 }
             }
@@ -104,7 +135,9 @@ fn request_endpoint(endpoint: &str, command: &str) -> Result<String, String> {
 }
 
 fn handle_connection(mut stream: TcpStream, token: &str, sender: &Sender<ControlRequest>) {
-    if set_timeouts(&stream).is_err() {
+    if stream.set_read_timeout(Some(SERVER_READ_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
+    {
         return;
     }
     let mut line = String::new();
