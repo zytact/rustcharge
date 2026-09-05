@@ -1,61 +1,62 @@
 use battery::State;
-use clap::Parser;
-use notify_rust::{Notification, Urgency};
+use clap::{Args, Parser, Subcommand};
+use config::{RuntimeConfig, SettingKey, StoredConfig, app_dir};
+use ipc::{ControlCommand, ControlRequest};
+use notify_rust::Notification;
+#[cfg(target_os = "linux")]
+use notify_rust::Urgency;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 use utils::battery_status::get_battery_status;
 use utils::sound::play_sound;
+
+mod config;
+mod ipc;
 mod utils;
 
 #[derive(Parser)]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    monitor: MonitorArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Set { setting: String, value: String },
+    Status,
+}
+
+#[derive(Args, Default)]
+struct MonitorArgs {
     #[arg(
         long = "sound-path",
         help = "Path to the sound file to play for notifications"
     )]
-    path: String,
-
+    path: Option<String>,
     #[cfg(target_os = "linux")]
-    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2), default_value = "1", help = "Notification urgency (0=Low, 1=Normal, 2=Critical)")]
-    urgency: u8,
-
-    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), default_value = "85", help = "Percentage above which you are notified")]
-    above: u8,
-
-    #[arg(long,value_parser = clap::value_parser!(u8).range(0..=100), default_value = "20", help = "Percentage below which you are notified")]
-    below: u8,
-
-    #[arg(
-        long = "no-below",
-        help = "Disable notifications for low battery",
-        action = clap::ArgAction::SetTrue
-    )]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2), help = "Notification urgency (0=Low, 1=Normal, 2=Critical; default: 1)")]
+    urgency: Option<u8>,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), help = "Percentage above which you are notified (default: 85)")]
+    above: Option<u8>,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100), help = "Percentage below which you are notified (default: 20)")]
+    below: Option<u8>,
+    #[arg(long = "no-below", help = "Disable notifications for low battery", action = clap::ArgAction::SetTrue)]
     no_below: bool,
-
-    #[arg(
-        long = "no-above",
-        help = "Disable notifications for high battery",
-        action = clap::ArgAction::SetTrue
-    )]
+    #[arg(long = "no-above", help = "Disable notifications for high battery", action = clap::ArgAction::SetTrue)]
     no_above: bool,
-
-    #[arg(
-        long,
-        default_value = "120",
-        help = "Seconds to wait before checking again"
-    )]
-    sec: u64,
-
-    #[arg(
-        long = "notify-attempts",
-        help = "How many notification attempts per session (minimum 1)",
-        value_parser = clap::value_parser!(u64).range(1..),
-        default_value = "15"
-    )]
-    notify_attempts: u64,
+    #[arg(long, help = "Seconds to wait before checking again (default: 120)")]
+    sec: Option<u64>,
+    #[arg(long = "notify-attempts", help = "How many notification attempts per session (default: 15, minimum: 1)", value_parser = clap::value_parser!(u64).range(1..))]
+    notify_attempts: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionType {
     None,
     AboveThreshold,
@@ -80,159 +81,381 @@ impl NotificationSession {
     fn is_active(&self) -> bool {
         self.session_type != SessionType::None
     }
-
     fn should_notify(&self, max_attempts: u64) -> bool {
         self.attempts_made < max_attempts
     }
-
     fn start_session(&mut self, session_type: SessionType) {
         self.session_type = session_type;
         self.attempts_made = 0;
     }
-
     fn increment_attempt(&mut self) {
         self.attempts_made += 1;
     }
-
     fn end_session(&mut self) {
         self.last_ended_session = self.session_type;
         self.session_type = SessionType::None;
         self.attempts_made = 0;
     }
-
     fn can_start_session(&self, session_type: SessionType) -> bool {
-        // Can start a new session if:
-        // 1. No session is active, AND
-        // 2. Either this is a different threshold type than the last ended one,
-        //    OR no session has ended yet
         !self.is_active() && self.last_ended_session != session_type
     }
-
     fn clear_last_ended(&mut self) {
         self.last_ended_session = SessionType::None;
     }
+
+    fn setting_changed(&mut self, key: SettingKey, value: &config::SettingValue) {
+        let affected = match (key, value) {
+            (SettingKey::AboveEnabled, config::SettingValue::Bool(_)) => {
+                SessionType::AboveThreshold
+            }
+            (SettingKey::BelowEnabled, config::SettingValue::Bool(_)) => {
+                SessionType::BelowThreshold
+            }
+            _ => return,
+        };
+        let config::SettingValue::Bool(enabled) = value else {
+            unreachable!()
+        };
+        if !enabled && self.session_type == affected {
+            self.end_session();
+        } else if *enabled && self.last_ended_session == affected {
+            self.clear_last_ended();
+        }
+    }
 }
 
-fn show_notification(args: &Cli, summary: &str, body: &str) {
+struct SoundEpochs {
+    above: AtomicU64,
+    below: AtomicU64,
+}
+
+impl SoundEpochs {
+    fn new() -> Self {
+        Self {
+            above: AtomicU64::new(0),
+            below: AtomicU64::new(0),
+        }
+    }
+    fn current(&self, session_type: SessionType) -> u64 {
+        match session_type {
+            SessionType::AboveThreshold => self.above.load(Ordering::Acquire),
+            SessionType::BelowThreshold => self.below.load(Ordering::Acquire),
+            SessionType::None => 0,
+        }
+    }
+    fn cancel(&self, session_type: SessionType) {
+        match session_type {
+            SessionType::AboveThreshold => {
+                self.above.fetch_add(1, Ordering::AcqRel);
+            }
+            SessionType::BelowThreshold => {
+                self.below.fetch_add(1, Ordering::AcqRel);
+            }
+            SessionType::None => {}
+        }
+    }
+}
+
+struct SoundJob {
+    path: String,
+    session_type: SessionType,
+    epoch: u64,
+}
+
+fn start_sound_worker(epochs: Arc<SoundEpochs>) -> SyncSender<SoundJob> {
+    let (sender, receiver) = mpsc::sync_channel::<SoundJob>(1);
+    thread::spawn(move || {
+        while let Ok(job) = receiver.recv() {
+            if epochs.current(job.session_type) == job.epoch {
+                play_sound(&job.path);
+            }
+        }
+    });
+    sender
+}
+
+fn show_notification(
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] config: &RuntimeConfig,
+    summary: &str,
+    body: &str,
+) {
     #[cfg(target_os = "linux")]
-    let urgency = match args.urgency {
+    let urgency = match config.urgency {
         0 => Urgency::Low,
         1 => Urgency::Normal,
         2 => Urgency::Critical,
-        _ => Urgency::Normal,
+        _ => unreachable!(),
     };
-
     #[cfg(target_os = "linux")]
-    {
-        Notification::new()
-            .summary(summary)
-            .body(body)
-            .appname("Rustcharge")
-            .urgency(urgency)
-            .show()
-            .expect("Failed to show notification");
-    }
-
+    Notification::new()
+        .summary(summary)
+        .body(body)
+        .appname("Rustcharge")
+        .urgency(urgency)
+        .show()
+        .expect("Failed to show notification");
     #[cfg(not(target_os = "linux"))]
-    {
-        Notification::new()
-            .summary(summary)
-            .body(body)
-            .appname("Rustcharge")
-            .show()
-            .expect("Failed to show notification");
-    }
-
-    play_sound(&args.path);
+    Notification::new()
+        .summary(summary)
+        .body(body)
+        .appname("Rustcharge")
+        .show()
+        .expect("Failed to show notification");
 }
 
 fn main() {
-    let args = Cli::parse();
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let cli = Cli::parse();
+    let app_dir = app_dir()?;
+    match cli.command {
+        Some(Command::Set { setting, value }) => {
+            let setting = SettingKey::parse(&setting)?;
+            println!(
+                "{}",
+                ipc::request(&app_dir, &format!("set {} {value}", setting_name(setting)))?
+            );
+            Ok(())
+        }
+        Some(Command::Status) => {
+            println!("{}", ipc::request(&app_dir, "status")?);
+            Ok(())
+        }
+        None => run_monitor(cli.monitor, app_dir),
+    }
+}
+
+fn run_monitor(args: MonitorArgs, app_dir: std::path::PathBuf) -> Result<(), String> {
+    let config_path = app_dir.join("config.toml");
+    let mut stored = StoredConfig::load(&config_path)?;
+    stored.validate()?;
+    let initial_sound = args
+        .path
+        .clone()
+        .or_else(|| stored.sound_path.clone())
+        .ok_or_else(|| {
+            "--sound-path is required when no persisted sound-path is set".to_string()
+        })?;
+    let mut config = RuntimeConfig::defaults(initial_sound);
+    config.apply_stored(&stored);
+    apply_cli_overrides(&mut config, args);
+    config.validate()?;
+
+    let (control_sender, control_receiver) = mpsc::channel();
+    let _server = ipc::Server::start(&app_dir, control_sender)?;
+    let epochs = Arc::new(SoundEpochs::new());
+    let sound_sender = start_sound_worker(Arc::clone(&epochs));
     let mut session = NotificationSession::new();
 
     loop {
-        match get_battery_status() {
-            Ok((state, ratio)) => {
-                let is_charging = matches!(state, State::Charging);
-                let charging_percentage = ratio.value * 100.0;
-                let status_text = if is_charging {
-                    "Charging"
-                } else {
-                    "Discharging"
-                };
-
-                // Determine current battery condition for starting new sessions
-                let above_threshold =
-                    !args.no_above && is_charging && charging_percentage >= args.above as f32;
-                let below_threshold =
-                    !args.no_below && !is_charging && charging_percentage <= args.below as f32;
-
-                // Handle battery entering safe zone
-                if !above_threshold && !below_threshold {
-                    // If there's an active session, terminate it
-                    if session.is_active() {
-                        session.end_session();
-                    }
-                    // Clear last_ended_session flag when battery is in safe zone
-                    else if session.last_ended_session != SessionType::None {
-                        session.clear_last_ended();
-                    }
-                }
-
-                // Session state machine
-                match session.session_type {
-                    SessionType::None => {
-                        // Not in a session - check if we should start one
-                        if above_threshold && session.can_start_session(SessionType::AboveThreshold)
-                        {
-                            session.start_session(SessionType::AboveThreshold);
-                        } else if below_threshold
-                            && session.can_start_session(SessionType::BelowThreshold)
-                        {
-                            session.start_session(SessionType::BelowThreshold);
-                        }
-                    }
-                    SessionType::AboveThreshold | SessionType::BelowThreshold => {
-                        // In an active session - keep it active until attempts are exhausted
-                        // Session will be ended when notify_attempts limit is reached (see below)
-                    }
-                }
-
-                // Send notification if session is active and attempts remain
-                if session.is_active() && session.should_notify(args.notify_attempts) {
-                    // Check if current conditions match the session type
-                    // For active sessions, we check conditions that match the session
-                    let should_send = match session.session_type {
-                        SessionType::AboveThreshold => {
-                            // Only check if above threshold and charging (original condition)
-                            above_threshold
-                        }
-                        SessionType::BelowThreshold => {
-                            // Only check if below threshold and not charging (original condition)
-                            below_threshold
-                        }
-                        SessionType::None => false,
-                    };
-
-                    if should_send {
-                        let summary = format!("Battery Status: {}", status_text);
-                        let body = format!("Charge: {:.0}%", charging_percentage);
-
-                        show_notification(&args, &summary, &body);
-
-                        session.increment_attempt();
-
-                        // Check if session should end after this notification
-                        if !session.should_notify(args.notify_attempts) {
-                            session.end_session();
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error getting battery status: {}", e);
+        evaluate_battery(&config, &mut session, &sound_sender, &epochs);
+        match control_receiver.recv_timeout(Duration::from_secs(config.sec)) {
+            Ok(request) => handle_control(
+                request,
+                &mut stored,
+                &mut config,
+                &mut session,
+                &epochs,
+                &config_path,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Control listener stopped".to_string());
             }
         }
-        thread::sleep(Duration::from_secs(args.sec));
+    }
+}
+
+fn evaluate_battery(
+    config: &RuntimeConfig,
+    session: &mut NotificationSession,
+    sound_sender: &SyncSender<SoundJob>,
+    epochs: &SoundEpochs,
+) {
+    let Ok((state, ratio)) = get_battery_status()
+        .inspect_err(|error| eprintln!("Error getting battery status: {error}"))
+    else {
+        return;
+    };
+    let is_charging = matches!(state, State::Charging);
+    let percentage = ratio.value * 100.0;
+    let (above, below) = battery_conditions(config, is_charging, percentage);
+
+    if !above && !below {
+        if session.is_active() {
+            session.end_session();
+        } else if session.last_ended_session != SessionType::None {
+            session.clear_last_ended();
+        }
+    }
+    if session.is_active() && !session.should_notify(config.notify_attempts) {
+        session.end_session();
+    }
+    if !session.is_active() {
+        if above && session.can_start_session(SessionType::AboveThreshold) {
+            session.start_session(SessionType::AboveThreshold);
+        } else if below && session.can_start_session(SessionType::BelowThreshold) {
+            session.start_session(SessionType::BelowThreshold);
+        }
+    }
+
+    let should_send = match session.session_type {
+        SessionType::AboveThreshold => above,
+        SessionType::BelowThreshold => below,
+        SessionType::None => false,
+    };
+    if should_send && session.should_notify(config.notify_attempts) {
+        let status = if is_charging {
+            "Charging"
+        } else {
+            "Discharging"
+        };
+        show_notification(
+            config,
+            &format!("Battery Status: {status}"),
+            &format!("Charge: {percentage:.0}%"),
+        );
+        let job = SoundJob {
+            path: config.sound_path.clone(),
+            session_type: session.session_type,
+            epoch: epochs.current(session.session_type),
+        };
+        if let Err(TrySendError::Full(_)) = sound_sender.try_send(job) {
+            eprintln!("Skipped notification sound because audio playback is still busy");
+        }
+        session.increment_attempt();
+        if !session.should_notify(config.notify_attempts) {
+            session.end_session();
+        }
+    }
+}
+
+fn battery_conditions(config: &RuntimeConfig, is_charging: bool, percentage: f32) -> (bool, bool) {
+    (
+        config.above_enabled && is_charging && percentage >= config.above as f32,
+        config.below_enabled && !is_charging && percentage <= config.below as f32,
+    )
+}
+
+fn handle_control(
+    request: ControlRequest,
+    stored: &mut StoredConfig,
+    config: &mut RuntimeConfig,
+    session: &mut NotificationSession,
+    epochs: &SoundEpochs,
+    config_path: &std::path::Path,
+) {
+    let response = match request.command {
+        ControlCommand::Status => Ok(config.status()),
+        ControlCommand::Set { key, value } => {
+            let mut next_stored = stored.clone();
+            next_stored.set(key, &value).and_then(|parsed| {
+                next_stored.validate()?;
+                next_stored.save(config_path)?;
+                if matches!(
+                    (key, &parsed),
+                    (SettingKey::AboveEnabled, config::SettingValue::Bool(false))
+                ) {
+                    epochs.cancel(SessionType::AboveThreshold);
+                }
+                if matches!(
+                    (key, &parsed),
+                    (SettingKey::BelowEnabled, config::SettingValue::Bool(false))
+                ) {
+                    epochs.cancel(SessionType::BelowThreshold);
+                }
+                session.setting_changed(key, &parsed);
+                config.apply_setting(key, parsed);
+                *stored = next_stored;
+                Ok(config.status())
+            })
+        }
+    };
+    let _ = request.reply.send(response);
+}
+
+fn apply_cli_overrides(config: &mut RuntimeConfig, args: MonitorArgs) {
+    if let Some(value) = args.path {
+        config.sound_path = value;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(value) = args.urgency {
+        config.urgency = value;
+    }
+    if let Some(value) = args.above {
+        config.above = value;
+    }
+    if let Some(value) = args.below {
+        config.below = value;
+    }
+    if args.no_above {
+        config.above_enabled = false;
+    }
+    if args.no_below {
+        config.below_enabled = false;
+    }
+    if let Some(value) = args.sec {
+        config.sec = value;
+    }
+    if let Some(value) = args.notify_attempts {
+        config.notify_attempts = value;
+    }
+}
+
+fn setting_name(setting: SettingKey) -> &'static str {
+    match setting {
+        SettingKey::Above => "above",
+        SettingKey::Below => "below",
+        SettingKey::AboveEnabled => "above-enabled",
+        SettingKey::BelowEnabled => "below-enabled",
+        SettingKey::SoundPath => "sound-path",
+        SettingKey::Urgency => "urgency",
+        SettingKey::Sec => "sec",
+        SettingKey::NotifyAttempts => "notify-attempts",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabling_and_reenabling_threshold_resets_that_session() {
+        let mut session = NotificationSession::new();
+        session.start_session(SessionType::AboveThreshold);
+        session.increment_attempt();
+        session.setting_changed(SettingKey::AboveEnabled, &config::SettingValue::Bool(false));
+        assert_eq!(session.session_type, SessionType::None);
+        assert_eq!(session.last_ended_session, SessionType::AboveThreshold);
+        session.setting_changed(SettingKey::AboveEnabled, &config::SettingValue::Bool(true));
+        assert!(session.can_start_session(SessionType::AboveThreshold));
+    }
+
+    #[test]
+    fn sound_and_urgency_keep_attempt_count() {
+        let mut session = NotificationSession::new();
+        session.start_session(SessionType::BelowThreshold);
+        session.increment_attempt();
+        session.setting_changed(
+            SettingKey::SoundPath,
+            &config::SettingValue::String("new.wav".to_string()),
+        );
+        session.setting_changed(SettingKey::Urgency, &config::SettingValue::U8(2));
+        assert_eq!(session.session_type, SessionType::BelowThreshold);
+        assert_eq!(session.attempts_made, 1);
+    }
+
+    #[test]
+    fn threshold_boundaries_are_inclusive_and_respect_charging_state() {
+        let config = RuntimeConfig::defaults("sound.wav".to_string());
+        assert_eq!(battery_conditions(&config, true, 85.0), (true, false));
+        assert_eq!(battery_conditions(&config, true, 84.9), (false, false));
+        assert_eq!(battery_conditions(&config, false, 20.0), (false, true));
+        assert_eq!(battery_conditions(&config, false, 20.1), (false, false));
     }
 }
